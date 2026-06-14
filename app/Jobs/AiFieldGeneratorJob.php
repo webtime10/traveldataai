@@ -1,0 +1,426 @@
+<?php
+
+namespace App\Jobs;
+
+use App\Models\Product;
+use App\Models\ProductDescription;
+use App\Services\GeminiProService;
+use App\Services\GeminiService;
+use App\Support\AiGenerationErrorReason;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use RuntimeException;
+use Throwable;
+
+class AiFieldGeneratorJob implements ShouldQueue
+{
+
+    //трейты Laravel, они добавляют поведение классу Job
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+//  "позволяет запускать Job через dispatch()"
+//  "даёт доступ к управлению задачей в очереди (delete, release и т.д.)"
+//  "добавляет настройки очереди (очередь, задержка, соединение)"
+//  "преобразует модели (например $product) в ID при передаче в очередь и восстанавливает их из БД"
+
+    private const ECHO_PREFIX_LEN = 320;
+    // "длина начала текста (в символах), которую сравниваем с промптом,
+    // чтобы понять — AI не вернул ли сам промпт вместо результата"
+
+
+    private const ECHO_SIMILARITY_THRESHOLD = 91.0;
+    // "порог схожести (%), при котором считаем,
+    // что ответ AI слишком похож на промпт (≈ ошибка генерации)"
+
+
+    /** Должен покрывать 3×API на длинных текстах; см. config ai.generation.queue_worker_timeout. */
+    public int $timeout = 7200;
+    // "максимальное время выполнения Job (в секундах)
+    
+    public int $tries = 1;
+    // "сколько раз Laravel будет пытаться выполнить Job при ошибке
+    // 1 = НЕ повторять (упал → всё, ошибка)"
+
+    public function __construct(
+        public Product $product,   // "модель товара; в очереди фактически передаётся его ID и потом он заново загружается из БД"
+        public int $languageId,    // "ID языка — определяет, для какой языковой версии (product_descriptions) идёт генерация"
+        public string $targetField,  // "название колонки в product_descriptions, куда будет записан результат (например ai_title)"
+        public string $sourceText, // "исходный текст (сырьё) для генерации; если пустой — будет взят из БД (result)"
+        /** @var object Результат DB::selectOne по prompt_category_descriptions + join */
+        public object $prompts, // "объект промптов (инструкций), уже выбранный по полю + языку + производителю;  // содержит несколько этапов: description, stage_2_live, stage_3_edit"
+        /** Этап 1 уже выполнен пакетно (GenerateAiDescriptionsBatchJob) — только stage_2 и stage_3. */
+        public bool $skipDescriptionStage = false,
+    ) {}
+
+    public function handle(): void   // "основной метод Job: выполняет генерацию текста через AI (3 этапа) и сохраняет результат в БД"
+    {
+        $freshProduct = $this->product->fresh();
+        if ($freshProduct) {
+            $this->product = $freshProduct;
+        }
+
+        $ctx = $this->logContext(); // "формирует контекст для логов (product_id, language_id, поле и др.),
+        $this->assertAllowedTargetField(); /// "проверяет, что targetField (поле для записи) разрешено; //// защита от записи в несуществующую или запрещённую колонку"
+
+        $sourceMaterial = trim((string) ($this->product->result ?? ''));
+        // После отдельного ExtractProductGistJob работаем с выжимкой из products.result, а не с полным сырьём.
+     
+        if ($sourceMaterial === '') {
+            Log::error('[AiFieldGeneratorJob] Пустое сырьё в джобе', $ctx);
+            throw new RuntimeException('Пустая выжимка products.result — генерация невозможна. Сначала должна отработать выжимка сырья.');
+        }
+
+        Log::info('[AiFieldGeneratorJob] Старт: '.($this->skipDescriptionStage
+            ? 'этап2 → этап3 (description уже в БД)'
+            : 'выжимка → колонка (этап1) → та же колонка (этап2) → та же колонка (этап3)'), $ctx + [
+            'source_len' => mb_strlen($sourceMaterial),
+            'source_sha1' => hash('sha1', $sourceMaterial),
+            'skip_description_stage' => $this->skipDescriptionStage,
+        ]);
+
+        $instruction1 = trim((string) ($this->prompts->description ?? ''));
+        $instruction2 = trim((string) ($this->prompts->stage_2_live ?? ''));
+        $instruction3 = trim((string) ($this->prompts->stage_3_edit ?? ''));
+
+        if ($this->skipDescriptionStage) {
+            if ($instruction2 === '' || $instruction3 === '') {
+                throw new RuntimeException('Заполните stage_2_live и stage_3_edit для категории промта (язык '.$this->languageId.').');
+            }
+        } elseif ($instruction1 === '' || $instruction2 === '' || $instruction3 === '') {
+            Log::error('[AiFieldGeneratorJob] В БД неполный набор промптов для трёх этапов', $ctx + [
+                'has_description' => $instruction1 !== '',
+                'has_stage_2_live' => $instruction2 !== '',
+                'has_stage_3_edit' => $instruction3 !== '',
+            ]);
+            throw new RuntimeException('Заполните description, stage_2_live и stage_3_edit для категории промта (язык '.$this->languageId.').');
+        }
+
+        $this->updateStatus(2);
+
+        $gemini = app(GeminiService::class);
+        $geminiChatTimeout = $gemini->defaultChatTimeout();
+        $geminiProChatTimeout = max(60, (int) config('services.gemini_pro.chat_timeout', 1800));
+
+        $needsDescriptionStage = ! $this->skipDescriptionStage || ! $this->targetColumnHasContent();
+        if ($this->skipDescriptionStage && $needsDescriptionStage) {
+            Log::warning('[AiFieldGeneratorJob] Пакетный description не записан — этап 1 для этого поля (Gemini Pro)', $ctx);
+        }
+
+        if ($needsDescriptionStage) {
+            if ($instruction1 === '') {
+                throw new RuntimeException(
+                    'Пакетный description не записан в колонку '.$this->targetField.' (язык '.$this->languageId.'). Заполните промпт description для этой категории.'
+                );
+            }
+
+            $geminiPro = app(GeminiProService::class);
+
+            Log::info('[AiFieldGeneratorJob] Этап 1: Gemini Pro (description) → запись в колонку', $ctx + [
+                'instruction_len' => mb_strlen($instruction1),
+                'material_len' => mb_strlen($sourceMaterial),
+                'model' => config('services.gemini_pro.model'),
+            ]);
+
+            $this->assertMaterialDiffersFromInstruction('before_extraction', $sourceMaterial, $instruction1, $ctx);
+
+            $step1Raw = $geminiPro->chat($sourceMaterial, $instruction1, $geminiProChatTimeout);
+            $step1 = $this->assertPipelineStage(
+                'Gemini Pro (description)',
+                $step1Raw,
+                $instruction1,
+                $ctx,
+                $geminiPro->lastHttpStatus()
+            );
+            $this->persistStageToTargetColumn($step1, $ctx, 'after_extraction');
+        }
+
+        // --- Этап 2: материал из колонки (результат этапа 1 / пакетного description) ---
+        $materialForStage2 = $this->loadMaterialFromTargetColumn($ctx, 'before_enliven');
+        $this->assertMaterialDiffersFromInstruction('before_enliven', $materialForStage2, $instruction2, $ctx);
+        Log::info('[AiFieldGeneratorJob] Этап 2: Gemini (Enliven), материал из БД', $ctx + [
+            'instruction_len' => mb_strlen($instruction2),
+            'material_len' => mb_strlen($materialForStage2),
+        ]);
+
+        $step2Raw = $gemini->chat($materialForStage2, $instruction2, $geminiChatTimeout);
+        $step2 = $this->assertPipelineStage(
+            'Gemini Enliven',
+            $step2Raw,
+            $instruction2,
+            $ctx,
+            $gemini->lastHttpStatus()
+        );
+        $this->persistStageToTargetColumn($step2, $ctx, 'after_enliven');
+
+        // --- Этап 3: снова из колонки → Gemini → та же колонка (финал для вида) ---
+        $materialForStage3 = $this->loadMaterialFromTargetColumn($ctx, 'before_editing');
+        $this->assertMaterialDiffersFromInstruction('before_editing', $materialForStage3, $instruction3, $ctx);
+        Log::info('[AiFieldGeneratorJob] Этап 3: Gemini (Editing), материал из БД', $ctx + [
+            'instruction_len' => mb_strlen($instruction3),
+            'material_len' => mb_strlen($materialForStage3),
+        ]);
+
+        $step3Raw = $gemini->chat($materialForStage3, $instruction3, $geminiChatTimeout);
+        $finalResult = $this->assertPipelineStage(
+            'Gemini Editing',
+            $step3Raw,
+            $instruction3,
+            $ctx,
+            $gemini->lastHttpStatus()
+        );
+        $this->persistStageToTargetColumn($finalResult, $ctx, 'after_editing_final');
+
+        $this->updateStatus(4);
+        $this->clearCache();
+
+        Log::info('[AiFieldGeneratorJob] Конвейер успешно завершён (все этапы в одной колонке)', $ctx);
+    }
+
+    private function assertAllowedTargetField(): void
+    {
+        if (! in_array($this->targetField, ProductDescription::aiFieldKeys(), true)) {
+            throw new RuntimeException('Недопустимое целевое поле: '.$this->targetField);
+        }
+    }
+
+    private function targetColumnHasContent(): bool
+    {
+        $raw = DB::table('product_descriptions')
+            ->where('product_id', $this->product->id)
+            ->where('language_id', $this->languageId)
+            ->value($this->targetField);
+
+        return trim(is_string($raw) ? $raw : (string) ($raw ?? '')) !== '';
+    }
+
+    /**
+     * Сохраняет результат этапа в ту же колонку product_descriptions.{target_field} — вид/фронт могут опросить БД и увидеть прогресс.
+     *
+     * @param  array<string, mixed>  $ctx
+     */
+    private function persistStageToTargetColumn(string $text, array $ctx, string $stageTag): void
+    {
+        $query = DB::table('product_descriptions')
+            ->where('product_id', $this->product->id)
+            ->where('language_id', $this->languageId);
+
+        $updated = $query->update([$this->targetField => $text]);
+        if ($updated > 0) {
+            Log::info('[AiFieldGeneratorJob] Результат этапа записан в колонку', $ctx + [
+                'stage' => $stageTag,
+                'written_len' => mb_strlen($text),
+            ]);
+
+            return;
+        }
+
+        // MySQL возвращает 0, если строка найдена, но значение в колонке уже такое же.
+        $existing = $query->value($this->targetField);
+        $normalizedExisting = is_string($existing) ? trim($existing) : trim((string) ($existing ?? ''));
+        $normalizedIncoming = trim($text);
+        if ($normalizedExisting !== '' && $normalizedExisting === $normalizedIncoming) {
+            Log::info('[AiFieldGeneratorJob] Запись этапа без изменений (no-op update)', $ctx + [
+                'stage' => $stageTag,
+                'written_len' => mb_strlen($text),
+            ]);
+
+            return;
+        }
+
+        Log::error('[AiFieldGeneratorJob] Не удалось записать этап в колонку', $ctx + ['stage' => $stageTag]);
+        throw new RuntimeException('Строка product_descriptions не найдена или колонка не обновлена (этап: '.$stageTag.').');
+    }
+
+    /**
+     * Читает текущее содержимое целевой колонки — вход для следующего промпта.
+     *
+     * @param  array<string, mixed>  $ctx
+     */
+    private function loadMaterialFromTargetColumn(array $ctx, string $readTag): string
+    {
+        $raw = DB::table('product_descriptions')
+            ->where('product_id', $this->product->id)
+            ->where('language_id', $this->languageId)
+            ->value($this->targetField);
+
+        $text = is_string($raw) ? trim($raw) : trim((string) ($raw ?? ''));
+
+        if ($text === '') {
+            Log::error('[AiFieldGeneratorJob] Колонка пуста при чтении для следующего этапа', $ctx + ['read_tag' => $readTag]);
+            throw new RuntimeException('Пустая колонка '.$this->targetField.' при чтении материала ('.$readTag.').');
+        }
+
+        Log::info('[AiFieldGeneratorJob] Материал для следующего этапа прочитан из колонки', $ctx + [
+            'read_tag' => $readTag,
+            'loaded_len' => mb_strlen($text),
+            'loaded_sha1' => hash('sha1', $text),
+        ]);
+
+        return $text;
+    }
+
+    /**
+     * Если в БД подтянулась «не та» строка промптов, материал может совпасть с инструкцией — тогда API часто возвращает сам промпт.
+     *
+     * @param  array<string, mixed>  $ctx
+     */
+    private function assertMaterialDiffersFromInstruction(string $readTag, string $material, string $instruction, array $ctx): void
+    {
+        $m = trim($material);
+        $i = trim($instruction);
+        if ($m === '' || $i === '') {
+            return;
+        }
+        if (mb_strtolower($m) === mb_strtolower($i)) {
+            Log::error('[AiFieldGeneratorJob] Материал для API совпадает с инструкцией этапа (проверьте выбор строки prompt_categories / manufacturer)', $ctx + [
+                'read_tag' => $readTag,
+                'len' => mb_strlen($m),
+            ]);
+            throw new RuntimeException('Материал совпадает с текстом инструкции ('.$readTag.') — вероятно выбрана неверная категория промта в БД.');
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $ctx
+     */
+    private function assertPipelineStage(string $stageLabel, ?string $raw, string $instruction, array $ctx, ?int $httpStatus = null): string
+    {
+        if ($raw === null) {
+            Log::error('[AiFieldGeneratorJob] API вернул null', $ctx + [
+                'stage' => $stageLabel,
+                'http_status' => $httpStatus,
+            ]);
+            $httpSuffix = $httpStatus !== null ? ' HTTP '.$httpStatus : '';
+            throw new RuntimeException("[{$stageLabel}] Пустой ответ API (null).{$httpSuffix}");
+        }
+
+        $out = trim($raw);
+        if ($out === '') {
+            Log::error('[AiFieldGeneratorJob] API вернул пустую строку', $ctx + ['stage' => $stageLabel]);
+            throw new RuntimeException("[{$stageLabel}] Пустой ответ после trim.");
+        }
+
+        if ($this->outputEchoesInstruction($out, $instruction)) {
+            Log::error('[AiFieldGeneratorJob] Ответ похож на текст инструкции (echo промпта)', $ctx + [
+                'stage' => $stageLabel,
+                'output_len' => mb_strlen($out),
+                'instruction_len' => mb_strlen(trim($instruction)),
+                'output_preview' => mb_substr($out, 0, 500),
+                'instruction_preview' => mb_substr(trim($instruction), 0, 500),
+            ]);
+            throw new RuntimeException(
+                "[{$stageLabel}] Ответ совпадает с инструкцией или её фрагментом — вероятно в запрос не попало сырьё или модель вернула промпт."
+            );
+        }
+
+        return $out;
+    }
+
+    private function outputEchoesInstruction(string $output, string $instruction): bool
+    {
+        $o = trim($output);
+        $i = trim($instruction);
+        if ($o === '' || $i === '') {
+            return false;
+        }
+
+        if (mb_strtolower($o) === mb_strtolower($i)) {
+            return true;
+        }
+
+        $lenO = mb_strlen($o);
+        $lenI = mb_strlen($i);
+
+        // Короткая инструкция (часто stage_3): ответ «промптом» — почти весь вывод совпадает с началом инструкции.
+        if ($lenI >= 40 && $lenI <= 800 && $lenO >= $lenI && mb_stripos($o, $i) === 0 && $lenO <= (int) ($lenI * 1.25)) {
+            return true;
+        }
+
+        $prefixLen = (int) min(self::ECHO_PREFIX_LEN, $lenO, $lenI);
+        if ($prefixLen >= 120 && mb_substr($o, 0, $prefixLen) === mb_substr($i, 0, $prefixLen) && $lenO <= (int) ($lenI * 1.25)) {
+            return true;
+        }
+
+        if ($lenO >= 200 && $lenO <= $lenI && mb_strpos($i, $o) !== false) {
+            return true;
+        }
+
+        if ($lenI >= 200 && $lenO >= $lenI && mb_stripos($o, $i) !== false && $lenO <= (int) ($lenI * 1.15)) {
+            return true;
+        }
+
+        $cap = 3500;
+        $so = $lenO > $cap ? mb_substr($o, 0, $cap) : $o;
+        $si = $lenI > $cap ? mb_substr($i, 0, $cap) : $i;
+        $percent = 0.0;
+        similar_text(mb_strtolower($so), mb_strtolower($si), $percent);
+        if ($percent >= self::ECHO_SIMILARITY_THRESHOLD && $lenO <= (int) ($lenI * 1.2)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    protected function logContext(): array
+    {
+        return [
+            'product_id' => $this->product->id,
+            'manufacturer_id' => $this->product->manufacturer_id,
+            'language_id' => $this->languageId,
+            'target_field' => $this->targetField,
+            'source_len' => mb_strlen((string) ($this->product->result ?? $this->sourceText)),
+        ];
+    }
+
+    protected function updateStatus(int $status): void
+    {
+        DB::table('products')
+            ->where('id', $this->product->id)
+            ->update(['ai_status' => json_encode($status)]);
+    }
+
+    /**
+     * Ключи должны совпадать с ProductController::aiGenerationStartedCacheKey / aiGenerationErrorCacheKey.
+     */
+    protected function clearCache(): void
+    {
+        Cache::forget('product_ai_generation_started_at:'.$this->product->id.':'.$this->targetField);
+    }
+
+    public function failed(?Throwable $exception): void
+    {
+        $this->updateStatus(5);
+        // Для UI-светофора: при падении обязательно сохраняем явный флаг ошибки,
+        // чтобы поле показывалось красным, а не "processing"/желтым.
+        Cache::forget('product_ai_generation_started_at:'.$this->product->id.':'.$this->targetField);
+        $reason = AiGenerationErrorReason::detectFromThrowable($exception);
+        $httpStatus = null;
+        if (preg_match('/HTTP\s+(\d{3})\b/', (string) ($exception?->getMessage() ?? ''), $matches) === 1) {
+            $httpStatus = (int) $matches[1];
+        }
+        Cache::put(
+            'product_ai_generation_error:'.$this->product->id.':'.$this->targetField,
+            [
+                'at' => time(),
+                'reason' => $reason,
+                'http_status' => $httpStatus,
+                'message' => $exception?->getMessage(),
+                'exception_class' => $exception ? $exception::class : null,
+            ],
+            now()->addDay()
+        );
+
+        Log::error('[AiFieldGeneratorJob] Конвейер остановлен (failed)', $this->logContext() + [
+            'message' => $exception?->getMessage(),
+            'exception_class' => $exception ? $exception::class : null,
+        ]);
+    }
+}

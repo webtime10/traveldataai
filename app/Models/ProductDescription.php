@@ -1,0 +1,104 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+
+class ProductDescription extends Model
+{
+    public const AI_FIELDS = [
+        'ai_text_about_the_country' => 'Текст о стране',
+        'ai_seasons_line' => 'Линейка сезонов',
+        'ai_faq' => 'FAQ',
+        'ai_regions_comparison' => 'Сравнение регионов',
+        'ai_attractions_slider' => 'Атракционы',
+        'ai_route_one_day' => 'Маршрут на день',
+        'ai_price_table' => 'Таблица цен',
+        'ai_expert_advice' => 'Советы экспертов',
+        'ai_expert' => 'Мнение экпертов',
+        'ai_active' => 'Активный отдых',
+        'ai_where_to_stay' => 'Где остановится',
+        'ai_parking' => 'Паркинг',
+        'ai_tourist_reviews' => 'Отзывы туристов',
+    ];
+
+
+    protected $fillable = [
+        'product_id',
+        'language_id',
+        'name',
+        'slug',
+        'description',
+        'ai_text_about_the_country',
+        'ai_seasons_line',
+        'ai_faq',
+        'ai_regions_comparison',
+        'ai_attractions_slider',
+        'ai_route_one_day',
+        'ai_active_otd',
+        'tag',
+        'meta_title',
+        'meta_description',
+        'meta_keyword',
+        'result',
+    ];
+
+    public function __construct(array $attributes = [])
+    {
+        parent::__construct($attributes);
+        $this->fillable(array_merge(
+            $this->getFillable(),
+            self::aiFieldKeys(),
+            \App\Support\AiDescriptionModelChoice::modelColumns()
+        ));
+    }
+
+    public static function aiFieldLabels(): array
+    {
+        return self::AI_FIELDS; // весь массив  это я предаю и работаю сним в контроллере
+    }
+
+    public static function aiFieldKeys(): array
+    {
+        return array_keys(self::AI_FIELDS);   // возьми только ключи
+    }
+
+
+    public function product(): BelongsTo
+    {
+        return $this->belongsTo(Product::class);
+    }
+
+    public function language(): BelongsTo
+    {
+        return $this->belongsTo(Language::class);
+    }
+
+    /**
+     * Поле в БД хранит JSON {title, text_1, text_2} или старый текст/HTML — для вывода в шаблоне.
+     */
+    public function aiStructuredFieldHtml(string $attribute): string
+    {
+        $value = $this->getAttribute($attribute);
+        if (! is_string($value) || trim($value) === '') {
+            return '';
+        }
+
+        $data = json_decode($value, true);
+        if (is_array($data) && (array_key_exists('text_1', $data) || array_key_exists('text_2', $data) || array_key_exists('title', $data))) {
+            $title = trim((string) ($data['title'] ?? ''));
+            $text1 = trim((string) ($data['text_1'] ?? ''));
+            $text2 = trim((string) ($data['text_2'] ?? ''));
+
+            $html = '';
+            if ($title !== '') {
+                $html .= '<p><strong>'.e($title).'</strong></p>'."\n\n";
+            }
+
+            return $html.$text1.($text1 !== '' && $text2 !== '' ? "\n\n" : '').$text2;
+        }
+
+        return nl2br(e($value));
+    }
+}
